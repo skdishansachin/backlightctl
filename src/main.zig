@@ -54,10 +54,11 @@ const usage: []const u8 =
 const Args = struct {
     operation: ?Operation = null,
     device: ?[]const u8 = null,
+    list: bool = false,
     help: bool = false,
     version: bool = false,
 
-    const Operation = enum { get };
+    const Operation = enum { get, max };
 
     const ParseError = error{
         UnknownFlag,
@@ -77,6 +78,9 @@ const Args = struct {
                     self.help = true;
                 } else if (std.mem.eql(u8, arg, "-V") or std.mem.eql(u8, arg, "--version")) {
                     self.version = true;
+                } else if (std.mem.eql(u8, arg, "-l") or std.mem.eql(u8, arg, "--list")) {
+                    if (self.operation != null) return error.TooManyOperations;
+                    self.list = true;
                 } else if (std.mem.eql(u8, arg, "-d") or std.mem.eql(u8, arg, "--device")) {
                     i += 1;
                     if (i >= argv.len) return error.MissingValue;
@@ -94,8 +98,11 @@ const Args = struct {
                     return error.UnknownFlag;
                 }
             } else if (std.mem.eql(u8, arg, "get")) {
-                if (self.operation != null) return error.TooManyOperations;
+                if (self.operation != null or self.list) return error.TooManyOperations;
                 self.operation = .get;
+            } else if (std.mem.eql(u8, arg, "max")) {
+                if (self.operation != null or self.list) return error.TooManyOperations;
+                self.operation = .max;
             } else {
                 return error.UnknownOperation;
             }
@@ -152,6 +159,11 @@ fn current(path: []const u8, io: std.Io) !u32 {
     };
 }
 
+fn percent(current_value: u32, max_value: u32) u8 {
+    if (max_value == 0) return 0;
+    return @intCast(@min(@as(u64, current_value) * 100 / max_value, 100));
+}
+
 fn fail(comptime fmt: []const u8, args: anytype) noreturn {
     std.debug.print(fmt, args);
     std.process.exit(1);
@@ -175,6 +187,32 @@ pub fn main(init: std.process.Init) !void {
 
     if (args.version) {
         try stdout.print("{s}\n", .{version});
+        try stdout.flush();
+        return;
+    }
+
+    if (args.list) {
+        const paths = list(io, allocator) catch fail("error: cannot read backlight devices\n", .{});
+        defer {
+            for (paths) |p| allocator.free(p);
+            allocator.free(paths);
+        }
+
+        var shown = false;
+        for (paths) |p| {
+            if (args.device) |wanted| {
+                if (!std.mem.eql(u8, name(p), wanted)) continue;
+            }
+            const cur = current(p, io) catch fail("error: cannot read brightness for '{s}'\n", .{name(p)});
+            const max = readU32(p, io, "max_brightness") catch fail("error: cannot read max brightness for '{s}'\n", .{name(p)});
+            try stdout.print("Device '{s}': {d}/{d} ({d}%)\n", .{ name(p), cur, max, percent(cur, max) });
+            shown = true;
+        }
+
+        if (!shown) {
+            if (args.device) |wanted| fail("error: no such device '{s}'\n", .{wanted});
+            fail("error: no backlight devices found\n", .{});
+        }
         try stdout.flush();
         return;
     }
@@ -203,12 +241,22 @@ pub fn main(init: std.process.Init) !void {
     defer allocator.free(dir);
     const dev_name = name(dir);
 
-    const op = args.operation orelse fail("error: invalid arguments; try 'backlightctl --help'\n", .{});
+    const cur = current(dir, io) catch fail("error: cannot read brightness for '{s}'\n", .{dev_name});
+    const max = readU32(dir, io, "max_brightness") catch fail("error: cannot read max brightness for '{s}'\n", .{dev_name});
+
+    const op = args.operation orelse {
+        try stdout.print("Device '{s}': {d}/{d} ({d}%)\n", .{ dev_name, cur, max, percent(cur, max) });
+        try stdout.flush();
+        return;
+    };
 
     switch (op) {
         .get => {
-            const cur = current(dir, io) catch fail("error: cannot read brightness for '{s}'\n", .{dev_name});
             try stdout.print("{d}\n", .{cur});
+            try stdout.flush();
+        },
+        .max => {
+            try stdout.print("{d}\n", .{max});
             try stdout.flush();
         },
     }
@@ -235,6 +283,33 @@ test "get operation" {
     try std.testing.expectEqual(Args.Operation.get, (try Args.parse(&.{ "backlightctl", "get" })).operation.?);
     try std.testing.expectEqual(@as(?Args.Operation, null), (try Args.parse(&.{"backlightctl"})).operation);
     try std.testing.expectError(error.TooManyOperations, Args.parse(&.{ "backlightctl", "get", "get" }));
+}
+
+test "max operation" {
+    try std.testing.expectEqual(Args.Operation.max, (try Args.parse(&.{ "backlightctl", "max" })).operation.?);
+    try std.testing.expectError(error.TooManyOperations, Args.parse(&.{ "backlightctl", "get", "max" }));
+}
+
+test "list flag" {
+    try std.testing.expect((try Args.parse(&.{ "backlightctl", "-l" })).list);
+    try std.testing.expect((try Args.parse(&.{ "backlightctl", "--list" })).list);
+    try std.testing.expectError(error.TooManyOperations, Args.parse(&.{ "backlightctl", "get", "-l" }));
+    try std.testing.expectError(error.TooManyOperations, Args.parse(&.{ "backlightctl", "-l", "get" }));
+    try std.testing.expectError(error.TooManyOperations, Args.parse(&.{ "backlightctl", "max", "--list" }));
+}
+
+test "no args defaults to status" {
+    const args = try Args.parse(&.{"backlightctl"});
+    try std.testing.expect(args.operation == null);
+    try std.testing.expect(!args.list);
+}
+
+test "percent computes clamped percentage" {
+    try std.testing.expectEqual(@as(u8, 10), percent(100, 1000));
+    try std.testing.expectEqual(@as(u8, 24), percent(240, 1000));
+    try std.testing.expectEqual(@as(u8, 100), percent(1000, 1000));
+    try std.testing.expectEqual(@as(u8, 100), percent(2000, 1000));
+    try std.testing.expectEqual(@as(u8, 0), percent(0, 0));
 }
 
 test "device flag forms" {
@@ -291,6 +366,7 @@ test "read current and max from fake device" {
     try std.testing.expectEqual(@as(u32, 100), try current(dir, io));
     try std.testing.expectEqual(@as(u32, 1000), try readU32(dir, io, "max_brightness"));
     try std.testing.expectEqualStrings("intel_backlight", name(dir));
+    try std.testing.expectEqual(@as(u8, 10), percent(100, 1000));
 }
 
 test "current falls back to brightness file" {
