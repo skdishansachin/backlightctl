@@ -53,12 +53,13 @@ const usage: []const u8 =
 
 const Args = struct {
     operation: ?Operation = null,
+    value: ?[]const u8 = null,
     device: ?[]const u8 = null,
     list: bool = false,
     help: bool = false,
     version: bool = false,
 
-    const Operation = enum { get, max };
+    const Operation = enum { get, max, set };
 
     const ParseError = error{
         UnknownFlag,
@@ -103,11 +104,54 @@ const Args = struct {
             } else if (std.mem.eql(u8, arg, "max")) {
                 if (self.operation != null or self.list) return error.TooManyOperations;
                 self.operation = .max;
+            } else if (std.mem.eql(u8, arg, "set")) {
+                if (self.operation != null or self.list) return error.TooManyOperations;
+                self.operation = .set;
+                i += 1;
+                if (i >= argv.len) return error.MissingValue;
+                self.value = argv[i];
             } else {
                 return error.UnknownOperation;
             }
         }
         return self;
+    }
+
+    fn parseValue(text: []const u8, current_value: u32, max_value: u32) !u32 {
+        if (text.len == 0) return error.InvalidValue;
+
+        var rest = text;
+        var delta: i2 = 0;
+        if (rest[0] == '+') {
+            delta = 1;
+            rest = rest[1..];
+        } else if (rest[0] == '-') {
+            delta = -1;
+            rest = rest[1..];
+        }
+        if (rest.len == 0) return error.InvalidValue;
+
+        var is_percent = false;
+        if (rest[rest.len - 1] == '%') {
+            is_percent = true;
+            rest = rest[0 .. rest.len - 1];
+        }
+        if (rest.len == 0) return error.InvalidValue;
+
+        const amount = std.fmt.parseInt(u64, rest, 10) catch return error.InvalidValue;
+
+        const wide_current: u64 = current_value;
+        const wide_max: u64 = max_value;
+        const result: u64 = switch (delta) {
+            0 => if (is_percent) (wide_max *| amount +| 50) / 100 else amount,
+            1 => if (is_percent) wide_current +| (wide_max *| amount +| 50) / 100 else wide_current +| amount,
+            -1 => if (is_percent) wide_current -| (wide_max *| amount +| 50) / 100 else wide_current -| amount,
+            else => unreachable,
+        };
+
+        if (result > max_value) return max_value;
+        if (result < 1) return 1;
+        return @intCast(result);
     }
 };
 
@@ -259,6 +303,25 @@ pub fn main(init: std.process.Init) !void {
             try stdout.print("{d}\n", .{max});
             try stdout.flush();
         },
+        .set => {
+            const text = args.value orelse fail("error: set needs a value\n", .{});
+            const target = Args.parseValue(text, cur, max) catch fail("error: invalid value '{s}'\n", .{text});
+
+            var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+            const file_path = try std.fmt.bufPrint(&path_buf, "{s}/brightness", .{dir});
+            var file = std.Io.Dir.openFileAbsolute(io, file_path, .{ .mode = .write_only }) catch |err| {
+                if (err == error.AccessDenied) fail("error: no permission to set brightness for '{s}' (install contrib/90-backlight.rules or run as root)\n", .{dev_name});
+                fail("error: cannot set brightness for '{s}'\n", .{dev_name});
+            };
+            defer file.close(io);
+
+            var text_buf: [32]u8 = undefined;
+            const text_out = try std.fmt.bufPrint(&text_buf, "{d}\n", .{target});
+            file.writeStreamingAll(io, text_out) catch fail("error: cannot set brightness for '{s}'\n", .{dev_name});
+
+            try stdout.print("Device '{s}': {d}/{d} ({d}%)\n", .{ dev_name, target, max, percent(target, max) });
+            try stdout.flush();
+        },
     }
 }
 
@@ -310,6 +373,47 @@ test "percent computes clamped percentage" {
     try std.testing.expectEqual(@as(u8, 100), percent(1000, 1000));
     try std.testing.expectEqual(@as(u8, 100), percent(2000, 1000));
     try std.testing.expectEqual(@as(u8, 0), percent(0, 0));
+}
+
+test "set takes a value" {
+    const args = try Args.parse(&.{ "backlightctl", "set", "+10%" });
+    try std.testing.expectEqual(Args.Operation.set, args.operation.?);
+    try std.testing.expectEqualStrings("+10%", args.value.?);
+    try std.testing.expectError(error.MissingValue, Args.parse(&.{ "backlightctl", "set" }));
+}
+
+test "parseValue absolute" {
+    try std.testing.expectEqual(@as(u32, 500), try Args.parseValue("500", 5409, 6009));
+    try std.testing.expectEqual(@as(u32, 6009), try Args.parseValue("999999", 5409, 6009));
+}
+
+test "parseValue absolute percent rounds half up" {
+    try std.testing.expectEqual(@as(u32, 3005), try Args.parseValue("50%", 5409, 6009));
+    try std.testing.expectEqual(@as(u32, 601), try Args.parseValue("10%", 5409, 6009));
+    try std.testing.expectEqual(@as(u32, 6009), try Args.parseValue("100%", 5409, 6009));
+}
+
+test "parseValue deltas" {
+    try std.testing.expectEqual(@as(u32, 5419), try Args.parseValue("+10", 5409, 6009));
+    try std.testing.expectEqual(@as(u32, 5359), try Args.parseValue("-50", 5409, 6009));
+    try std.testing.expectEqual(@as(u32, 6009), try Args.parseValue("+999999", 5409, 6009));
+    try std.testing.expectEqual(@as(u32, 1), try Args.parseValue("-5900", 5409, 6009));
+}
+
+test "parseValue percent deltas round half up" {
+    try std.testing.expectEqual(@as(u32, 6009), try Args.parseValue("+10%", 5409, 6009));
+    try std.testing.expectEqual(@as(u32, 2404), try Args.parseValue("-50%", 5409, 6009));
+}
+
+test "parseValue clamps to min 1" {
+    try std.testing.expectEqual(@as(u32, 1), try Args.parseValue("0", 5409, 6009));
+    try std.testing.expectEqual(@as(u32, 3005), try Args.parseValue("50%", 5409, 6009));
+}
+
+test "parseValue rejects garbage" {
+    for ([_][]const u8{ "", "%", "+", "-", "abc", "10%%", "+-", " 50", "50 ", "50-", "50%-" }) |bad| {
+        try std.testing.expectError(error.InvalidValue, Args.parseValue(bad, 5409, 6009));
+    }
 }
 
 test "device flag forms" {
