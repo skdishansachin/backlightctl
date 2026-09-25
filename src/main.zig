@@ -59,7 +59,7 @@ const Args = struct {
     help: bool = false,
     version: bool = false,
 
-    const Operation = enum { get, max, set };
+    const Operation = enum { get, max, set, monitor };
 
     const ParseError = error{
         UnknownFlag,
@@ -104,6 +104,9 @@ const Args = struct {
             } else if (std.mem.eql(u8, arg, "max")) {
                 if (self.operation != null or self.list) return error.TooManyOperations;
                 self.operation = .max;
+            } else if (std.mem.eql(u8, arg, "monitor")) {
+                if (self.operation != null or self.list) return error.TooManyOperations;
+                self.operation = .monitor;
             } else if (std.mem.eql(u8, arg, "set")) {
                 if (self.operation != null or self.list) return error.TooManyOperations;
                 self.operation = .set;
@@ -206,6 +209,27 @@ fn current(path: []const u8, io: std.Io) !u32 {
 fn percent(current_value: u32, max_value: u32) u8 {
     if (max_value == 0) return 0;
     return @intCast(@min(@as(u64, current_value) * 100 / max_value, 100));
+}
+
+fn isBacklightChange(event: []const u8, device_name: []const u8) bool {
+    var action_change = false;
+    var subsystem_backlight = false;
+    var our_device = false;
+
+    var parts = std.mem.splitScalar(u8, event, 0);
+    while (parts.next()) |part| {
+        if (part.len == 0) continue;
+        if (std.mem.eql(u8, part, "ACTION=change")) {
+            action_change = true;
+        } else if (std.mem.eql(u8, part, "SUBSYSTEM=backlight")) {
+            subsystem_backlight = true;
+        } else if (std.mem.startsWith(u8, part, "DEVPATH=")) {
+            if (std.mem.endsWith(u8, part, device_name)) our_device = true;
+        } else if (std.mem.indexOfScalar(u8, part, '=') == null) {
+            if (std.mem.endsWith(u8, part, device_name)) our_device = true;
+        }
+    }
+    return action_change and subsystem_backlight and our_device;
 }
 
 fn fail(comptime fmt: []const u8, args: anytype) noreturn {
@@ -322,6 +346,76 @@ pub fn main(init: std.process.Init) !void {
             try stdout.print("Device '{s}': {d}/{d} ({d}%)\n", .{ dev_name, target, max, percent(target, max) });
             try stdout.flush();
         },
+        .monitor => {
+            var nfd: ?i32 = null;
+            {
+                const rc = std.os.linux.socket(std.os.linux.AF.NETLINK, std.os.linux.SOCK.DGRAM, std.os.linux.NETLINK.KOBJECT_UEVENT);
+                if (std.os.linux.errno(rc) == .SUCCESS) {
+                    const fd: i32 = @intCast(rc);
+                    const address = std.os.linux.sockaddr.nl{ .pid = 0, .groups = 1 };
+                    if (std.os.linux.errno(std.os.linux.bind(fd, @ptrCast(&address), @intCast(@sizeOf(@TypeOf(address))))) == .SUCCESS) {
+                        nfd = fd;
+                    } else {
+                        _ = std.os.linux.close(fd);
+                    }
+                }
+                if (nfd == null) std.debug.print("warning: netlink unavailable, watching sysfs only\n", .{});
+            }
+            defer {
+                if (nfd) |fd| _ = std.os.linux.close(fd);
+            }
+
+            var poll_buf: [std.fs.max_path_bytes:0]u8 = undefined;
+            const poll_path = try std.fmt.bufPrintZ(&poll_buf, "{s}/actual_brightness", .{dir});
+            const sysfs_fd: i32 = blk: {
+                const rc = std.os.linux.open(poll_path, .{}, 0);
+                if (std.os.linux.errno(rc) != .SUCCESS) fail("error: cannot watch brightness for '{s}'\n", .{dev_name});
+                break :blk @intCast(rc);
+            };
+            defer _ = std.os.linux.close(sysfs_fd);
+
+            try stdout.print("{s},{d},{d},{d}%\n", .{ dev_name, cur, max, percent(cur, max) });
+            try stdout.flush();
+
+            var last = cur;
+            var buf: [8192]u8 = undefined;
+            while (true) {
+                var fds: [2]std.posix.pollfd = undefined;
+                var count: usize = 0;
+                if (nfd) |fd| {
+                    fds[count] = .{ .fd = fd, .events = std.os.linux.POLL.IN, .revents = 0 };
+                    count += 1;
+                }
+                fds[count] = .{ .fd = sysfs_fd, .events = std.os.linux.POLL.PRI | std.os.linux.POLL.ERR, .revents = 0 };
+                count += 1;
+
+                _ = try std.posix.poll(fds[0..count], -1);
+
+                var matched = false;
+                if (nfd) |fd| {
+                    if (fds[0].revents != 0) {
+                        const rc = std.os.linux.recvfrom(fd, &buf, buf.len, 0, null, null);
+                        if (std.os.linux.errno(rc) != .SUCCESS) fail("error: lost event stream\n", .{});
+                        matched = isBacklightChange(buf[0..@as(usize, @intCast(rc))], dev_name);
+                    }
+                }
+                if (fds[count - 1].revents != 0) {
+                    matched = true;
+                    // Disarm with seek+read; close/reopen spins at 100% CPU.
+                    if (std.os.linux.errno(std.os.linux.lseek(sysfs_fd, 0, std.os.linux.SEEK.SET)) != .SUCCESS) fail("error: lost event stream\n", .{});
+                    var scratch: [32]u8 = undefined;
+                    const read_rc = std.os.linux.read(sysfs_fd, &scratch, scratch.len);
+                    if (std.os.linux.errno(read_rc) != .SUCCESS) fail("error: lost event stream\n", .{});
+                }
+                if (!matched) continue;
+
+                const now = try current(dir, io);
+                if (now == last) continue;
+                last = now;
+                try stdout.print("{s},{d},{d},{d}%\n", .{ dev_name, now, max, percent(now, max) });
+                try stdout.flush();
+            }
+        },
     }
 }
 
@@ -351,6 +445,14 @@ test "get operation" {
 test "max operation" {
     try std.testing.expectEqual(Args.Operation.max, (try Args.parse(&.{ "backlightctl", "max" })).operation.?);
     try std.testing.expectError(error.TooManyOperations, Args.parse(&.{ "backlightctl", "get", "max" }));
+}
+
+test "monitor operation" {
+    try std.testing.expectEqual(Args.Operation.monitor, (try Args.parse(&.{ "backlightctl", "monitor" })).operation.?);
+    try std.testing.expectError(error.TooManyOperations, Args.parse(&.{ "backlightctl", "get", "monitor" }));
+    try std.testing.expectError(error.TooManyOperations, Args.parse(&.{ "backlightctl", "monitor", "get" }));
+    try std.testing.expectError(error.TooManyOperations, Args.parse(&.{ "backlightctl", "-l", "monitor" }));
+    try std.testing.expectError(error.TooManyOperations, Args.parse(&.{ "backlightctl", "monitor", "-l" }));
 }
 
 test "list flag" {
@@ -425,6 +527,26 @@ test "device flag forms" {
     try std.testing.expectEqualStrings("intel_backlight", long_eq.device.?);
     try std.testing.expectError(error.MissingValue, Args.parse(&.{ "backlightctl", "-d" }));
     try std.testing.expectError(error.InvalidValue, Args.parse(&.{ "backlightctl", "--device=" }));
+}
+
+test "backlight change for our device matches" {
+    const event = "change@/devices/pci/backlight/intel_backlight\x00ACTION=change\x00SUBSYSTEM=backlight\x00DEVPATH=/devices/pci/backlight/intel_backlight\x00SEQNUM=1234\x00";
+    try std.testing.expect(isBacklightChange(event, "intel_backlight"));
+}
+
+test "other subsystem does not match" {
+    const event = "change@/devices/power_supply/BAT0\x00ACTION=change\x00SUBSYSTEM=power_supply\x00DEVPATH=/devices/power_supply/BAT0\x00SEQNUM=1235\x00";
+    try std.testing.expect(!isBacklightChange(event, "intel_backlight"));
+}
+
+test "backlight add does not match" {
+    const event = "add@/devices/pci/backlight/intel_backlight\x00ACTION=add\x00SUBSYSTEM=backlight\x00DEVPATH=/devices/pci/backlight/intel_backlight\x00SEQNUM=1236\x00";
+    try std.testing.expect(!isBacklightChange(event, "intel_backlight"));
+}
+
+test "other backlight device does not match" {
+    const event = "change@/devices/pci/backlight/acpi_video0\x00ACTION=change\x00SUBSYSTEM=backlight\x00DEVPATH=/devices/pci/backlight/acpi_video0\x00SEQNUM=1237\x00";
+    try std.testing.expect(!isBacklightChange(event, "intel_backlight"));
 }
 
 fn makeFakeDevice(dir: *std.Io.Dir, io: std.Io, device_name: []const u8, brightness: []const u8, max_brightness: []const u8) !void {
