@@ -124,7 +124,7 @@ const Args = struct {
         if (text.len == 0) return error.InvalidValue;
 
         var rest = text;
-        var delta: i2 = 0;
+        var delta: i8 = 0;
         if (rest[0] == '+') {
             delta = 1;
             rest = rest[1..];
@@ -145,10 +145,11 @@ const Args = struct {
 
         const wide_current: u64 = current_value;
         const wide_max: u64 = max_value;
+        const step: u64 = if (is_percent) (wide_max *| amount +| 50) / 100 else amount;
         const result: u64 = switch (delta) {
-            0 => if (is_percent) (wide_max *| amount +| 50) / 100 else amount,
-            1 => if (is_percent) wide_current +| (wide_max *| amount +| 50) / 100 else wide_current +| amount,
-            -1 => if (is_percent) wide_current -| (wide_max *| amount +| 50) / 100 else wide_current -| amount,
+            0 => step,
+            1 => wide_current +| step,
+            -1 => wide_current -| step,
             else => unreachable,
         };
 
@@ -160,13 +161,10 @@ const Args = struct {
 
 const base_directory = "/sys/class/backlight";
 
-fn list(io: std.Io, allocator: std.mem.Allocator) ![][]const u8 {
-    var directory = try std.Io.Dir.openDirAbsolute(io, base_directory, .{ .iterate = true, .follow_symlinks = true });
+fn list(io: std.Io, allocator: std.mem.Allocator, base_path: []const u8) ![][]const u8 {
+    var directory = try std.Io.Dir.openDirAbsolute(io, base_path, .{ .iterate = true, .follow_symlinks = true });
     defer directory.close(io);
-    return listIn(directory, io, base_directory, allocator);
-}
 
-fn listIn(directory: std.Io.Dir, io: std.Io, base_path: []const u8, allocator: std.mem.Allocator) ![][]const u8 {
     var out: std.ArrayList([]const u8) = .empty;
     errdefer {
         for (out.items) |path| allocator.free(path);
@@ -224,17 +222,11 @@ fn isBacklightChange(event: []const u8, device_name: []const u8) bool {
         } else if (std.mem.eql(u8, part, "SUBSYSTEM=backlight")) {
             subsystem_backlight = true;
         } else if (std.mem.startsWith(u8, part, "DEVPATH=")) {
-            if (std.mem.endsWith(u8, part, device_name)) our_device = true;
-        } else if (std.mem.indexOfScalar(u8, part, '=') == null) {
-            if (std.mem.endsWith(u8, part, device_name)) our_device = true;
+            const devpath = part["DEVPATH=".len..];
+            if (std.mem.eql(u8, name(devpath), device_name)) our_device = true;
         }
     }
     return action_change and subsystem_backlight and our_device;
-}
-
-fn fail(comptime fmt: []const u8, args: anytype) noreturn {
-    std.debug.print(fmt, args);
-    std.process.exit(1);
 }
 
 pub fn main(init: std.process.Init) !void {
@@ -245,7 +237,7 @@ pub fn main(init: std.process.Init) !void {
     const stdout = &stdout_writer.interface;
 
     const argv = try init.minimal.args.toSlice(allocator);
-    const args = Args.parse(argv) catch fail("error: invalid arguments; try 'backlightctl --help'\n", .{});
+    const args = Args.parse(argv) catch std.process.fatal("invalid arguments; try 'backlightctl --help'\n", .{});
 
     if (args.help) {
         try stdout.print("{s}\n", .{usage});
@@ -260,7 +252,7 @@ pub fn main(init: std.process.Init) !void {
     }
 
     if (args.list) {
-        const paths = list(io, allocator) catch fail("error: cannot read backlight devices\n", .{});
+        const paths = list(io, allocator, base_directory) catch std.process.fatal("cannot read backlight devices\n", .{});
         defer {
             for (paths) |p| allocator.free(p);
             allocator.free(paths);
@@ -271,46 +263,47 @@ pub fn main(init: std.process.Init) !void {
             if (args.device) |wanted| {
                 if (!std.mem.eql(u8, name(p), wanted)) continue;
             }
-            const cur = current(p, io) catch fail("error: cannot read brightness for '{s}'\n", .{name(p)});
-            const max = readU32(p, io, "max_brightness") catch fail("error: cannot read max brightness for '{s}'\n", .{name(p)});
+            const cur = current(p, io) catch std.process.fatal("cannot read brightness for '{s}'\n", .{name(p)});
+            const max = readU32(p, io, "max_brightness") catch std.process.fatal("cannot read max brightness for '{s}'\n", .{name(p)});
             try stdout.print("Device '{s}': {d}/{d} ({d}%)\n", .{ name(p), cur, max, percent(cur, max) });
             shown = true;
         }
 
         if (!shown) {
-            if (args.device) |wanted| fail("error: no such device '{s}'\n", .{wanted});
-            fail("error: no backlight devices found\n", .{});
+            if (args.device) |wanted| std.process.fatal("no such device '{s}'\n", .{wanted});
+            std.process.fatal("no backlight devices found\n", .{});
         }
         try stdout.flush();
         return;
     }
 
     const dir: []const u8 = blk: {
-        const paths = list(io, allocator) catch fail("error: cannot read backlight devices\n", .{});
-        defer allocator.free(paths);
         if (args.device) |wanted| {
-            for (paths, 0..) |p, i| {
-                if (!std.mem.eql(u8, name(p), wanted)) continue;
-                for (paths, 0..) |other, j| {
-                    if (j != i) allocator.free(other);
-                }
-                break :blk p;
-            }
-            for (paths) |p| allocator.free(p);
-            fail("error: no such device '{s}'\n", .{wanted});
+            var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+            const full = try std.fmt.bufPrint(&path_buf, "{s}/{s}", .{ base_directory, wanted });
+            var check = std.Io.Dir.openDirAbsolute(io, full, .{}) catch std.process.fatal("no such device '{s}'\n", .{wanted});
+            check.close(io);
+            break :blk try allocator.dupe(u8, full);
         }
-        if (paths.len == 0) fail("error: no backlight devices found\n", .{});
+        const paths = list(io, allocator, base_directory) catch std.process.fatal("cannot read backlight devices\n", .{});
+        if (paths.len == 0) {
+            allocator.free(paths);
+            std.process.fatal("no backlight devices found\n", .{});
+        }
         if (paths.len > 1) {
             for (paths) |p| allocator.free(p);
-            fail("error: multiple backlight devices found, specify -d DEVICE (see `backlightctl -l`)\n", .{});
+            allocator.free(paths);
+            std.process.fatal("multiple backlight devices found, specify -d DEVICE (see `backlightctl -l`)\n", .{});
         }
-        break :blk paths[0];
+        const only = paths[0];
+        allocator.free(paths);
+        break :blk only;
     };
     defer allocator.free(dir);
     const dev_name = name(dir);
 
-    const cur = current(dir, io) catch fail("error: cannot read brightness for '{s}'\n", .{dev_name});
-    const max = readU32(dir, io, "max_brightness") catch fail("error: cannot read max brightness for '{s}'\n", .{dev_name});
+    const cur = current(dir, io) catch std.process.fatal("cannot read brightness for '{s}'\n", .{dev_name});
+    const max = readU32(dir, io, "max_brightness") catch std.process.fatal("cannot read max brightness for '{s}'\n", .{dev_name});
 
     const op = args.operation orelse {
         try stdout.print("Device '{s}': {d}/{d} ({d}%)\n", .{ dev_name, cur, max, percent(cur, max) });
@@ -328,20 +321,20 @@ pub fn main(init: std.process.Init) !void {
             try stdout.flush();
         },
         .set => {
-            const text = args.value orelse fail("error: set needs a value\n", .{});
-            const target = Args.parseValue(text, cur, max) catch fail("error: invalid value '{s}'\n", .{text});
+            const text = args.value orelse std.process.fatal("set needs a value\n", .{});
+            const target = Args.parseValue(text, cur, max) catch std.process.fatal("invalid value '{s}'\n", .{text});
 
             var path_buf: [std.fs.max_path_bytes]u8 = undefined;
             const file_path = try std.fmt.bufPrint(&path_buf, "{s}/brightness", .{dir});
             var file = std.Io.Dir.openFileAbsolute(io, file_path, .{ .mode = .write_only }) catch |err| {
-                if (err == error.AccessDenied) fail("error: no permission to set brightness for '{s}' (install contrib/90-backlight.rules or run as root)\n", .{dev_name});
-                fail("error: cannot set brightness for '{s}'\n", .{dev_name});
+                if (err == error.AccessDenied) std.process.fatal("no permission to set brightness for '{s}' (install contrib/90-backlight.rules or run as root)\n", .{dev_name});
+                std.process.fatal("cannot set brightness for '{s}'\n", .{dev_name});
             };
             defer file.close(io);
 
             var text_buf: [32]u8 = undefined;
             const text_out = try std.fmt.bufPrint(&text_buf, "{d}\n", .{target});
-            file.writeStreamingAll(io, text_out) catch fail("error: cannot set brightness for '{s}'\n", .{dev_name});
+            file.writeStreamingAll(io, text_out) catch std.process.fatal("cannot set brightness for '{s}'\n", .{dev_name});
 
             try stdout.print("Device '{s}': {d}/{d} ({d}%)\n", .{ dev_name, target, max, percent(target, max) });
             try stdout.flush();
@@ -359,7 +352,7 @@ pub fn main(init: std.process.Init) !void {
                         _ = std.os.linux.close(fd);
                     }
                 }
-                if (nfd == null) std.debug.print("warning: netlink unavailable, watching sysfs only\n", .{});
+                if (nfd == null) std.log.warn("netlink unavailable, watching sysfs only", .{});
             }
             defer {
                 if (nfd) |fd| _ = std.os.linux.close(fd);
@@ -369,7 +362,7 @@ pub fn main(init: std.process.Init) !void {
             const poll_path = try std.fmt.bufPrintZ(&poll_buf, "{s}/actual_brightness", .{dir});
             const sysfs_fd: i32 = blk: {
                 const rc = std.os.linux.open(poll_path, .{}, 0);
-                if (std.os.linux.errno(rc) != .SUCCESS) fail("error: cannot watch brightness for '{s}'\n", .{dev_name});
+                if (std.os.linux.errno(rc) != .SUCCESS) std.process.fatal("cannot watch brightness for '{s}'\n", .{dev_name});
                 break :blk @intCast(rc);
             };
             defer _ = std.os.linux.close(sysfs_fd);
@@ -381,31 +374,30 @@ pub fn main(init: std.process.Init) !void {
             var buf: [8192]u8 = undefined;
             while (true) {
                 var fds: [2]std.posix.pollfd = undefined;
-                var count: usize = 0;
+                const has_netlink = nfd != null;
                 if (nfd) |fd| {
-                    fds[count] = .{ .fd = fd, .events = std.os.linux.POLL.IN, .revents = 0 };
-                    count += 1;
+                    fds[0] = .{ .fd = fd, .events = std.os.linux.POLL.IN, .revents = 0 };
                 }
-                fds[count] = .{ .fd = sysfs_fd, .events = std.os.linux.POLL.PRI | std.os.linux.POLL.ERR, .revents = 0 };
-                count += 1;
+                fds[if (has_netlink) 1 else 0] = .{ .fd = sysfs_fd, .events = std.os.linux.POLL.PRI | std.os.linux.POLL.ERR, .revents = 0 };
+                const nfds: usize = if (has_netlink) 2 else 1;
 
-                _ = try std.posix.poll(fds[0..count], -1);
+                _ = try std.posix.poll(fds[0..nfds], -1);
 
                 var matched = false;
                 if (nfd) |fd| {
                     if (fds[0].revents != 0) {
                         const rc = std.os.linux.recvfrom(fd, &buf, buf.len, 0, null, null);
-                        if (std.os.linux.errno(rc) != .SUCCESS) fail("error: lost event stream\n", .{});
+                        if (std.os.linux.errno(rc) != .SUCCESS) std.process.fatal("lost event stream\n", .{});
                         matched = isBacklightChange(buf[0..@as(usize, @intCast(rc))], dev_name);
                     }
                 }
-                if (fds[count - 1].revents != 0) {
+                if (fds[nfds - 1].revents != 0) {
                     matched = true;
                     // Disarm with seek+read; close/reopen spins at 100% CPU.
-                    if (std.os.linux.errno(std.os.linux.lseek(sysfs_fd, 0, std.os.linux.SEEK.SET)) != .SUCCESS) fail("error: lost event stream\n", .{});
+                    if (std.os.linux.errno(std.os.linux.lseek(sysfs_fd, 0, std.os.linux.SEEK.SET)) != .SUCCESS) std.process.fatal("lost event stream\n", .{});
                     var scratch: [32]u8 = undefined;
                     const read_rc = std.os.linux.read(sysfs_fd, &scratch, scratch.len);
-                    if (std.os.linux.errno(read_rc) != .SUCCESS) fail("error: lost event stream\n", .{});
+                    if (std.os.linux.errno(read_rc) != .SUCCESS) std.process.fatal("lost event stream\n", .{});
                 }
                 if (!matched) continue;
 
@@ -549,6 +541,11 @@ test "other backlight device does not match" {
     try std.testing.expect(!isBacklightChange(event, "intel_backlight"));
 }
 
+test "device suffix does not match" {
+    const event = "change@/devices/pci/backlight/my_intel_backlight\x00ACTION=change\x00SUBSYSTEM=backlight\x00DEVPATH=/devices/pci/backlight/my_intel_backlight\x00SEQNUM=1238\x00";
+    try std.testing.expect(!isBacklightChange(event, "intel_backlight"));
+}
+
 fn makeFakeDevice(dir: *std.Io.Dir, io: std.Io, device_name: []const u8, brightness: []const u8, max_brightness: []const u8) !void {
     try dir.createDir(io, device_name, .default_dir);
     var sub = try dir.openDir(io, device_name, .{});
@@ -567,7 +564,11 @@ test "list finds fake devices" {
     try makeFakeDevice(&tmp.dir, io, "intel_backlight", "100\n", "1000\n");
     try makeFakeDevice(&tmp.dir, io, "acpi_video0", "200\n", "1000\n");
 
-    const paths = try listIn(tmp.dir, io, "/fake-sysfs", allocator);
+    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const base_len = try tmp.dir.realPath(io, &path_buf);
+    const base = path_buf[0..base_len];
+
+    const paths = try list(io, allocator, base);
     defer {
         for (paths) |p| allocator.free(p);
         allocator.free(paths);
@@ -630,10 +631,14 @@ test "list OOM frees each allocation exactly once" {
     try tmp.dir.createDirPath(io, "fake1");
     try tmp.dir.createDirPath(io, "fake2");
 
+    var base_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const base_len = try tmp.dir.realPath(io, &base_buf);
+    const base = base_buf[0..base_len];
+
     var fail_index: usize = 0;
     while (fail_index < 16) : (fail_index += 1) {
         var failing = std.testing.FailingAllocator.init(backing, .{ .fail_index = fail_index });
-        const result = listIn(tmp.dir, io, "/fake-sysfs", failing.allocator());
+        const result = list(io, failing.allocator(), base);
         if (result) |paths| {
             try std.testing.expectEqual(@as(usize, 3), paths.len);
             for (paths) |path| failing.allocator().free(path);
