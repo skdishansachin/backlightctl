@@ -12,7 +12,7 @@ Writing needs access to `/sys/class/backlight`. Either install the udev rule or 
 
 ```
 sudo cp contrib/90-backlight.rules /etc/udev/rules.d/
-sudo udevadm control --reload-rules && sudo udevadm trigger --subsystem-match=backlight
+sudo udevadm control --reload-rules && sudo udevadm trigger --subsystem-match=backlight --action=add
 ```
 
 Then add your user to the `video` group and log back in.
