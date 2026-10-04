@@ -359,7 +359,7 @@ pub fn main(init: std.process.Init) !void {
             }
 
             var poll_buf: [std.fs.max_path_bytes:0]u8 = undefined;
-            const poll_path = try std.fmt.bufPrintZ(&poll_buf, "{s}/actual_brightness", .{dir});
+            const poll_path = try std.fmt.bufPrintSentinel(&poll_buf, "{s}/actual_brightness", .{dir}, 0);
             const sysfs_fd: i32 = blk: {
                 const rc = std.os.linux.open(poll_path, .{}, 0);
                 if (std.os.linux.errno(rc) != .SUCCESS) std.process.fatal("cannot watch brightness for '{s}'\n", .{dev_name});
